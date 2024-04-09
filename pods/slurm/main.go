@@ -5,10 +5,11 @@
 package main
 
 import (
-	"encoding/json"
+  "encoding/json"
+  "golang.org/x/crypto/ssh"
 	"fmt"
-	"net/http"
 	"os"
+  "bytes"
 	"strconv"
 	"strings"
 	"time"
@@ -45,8 +46,20 @@ var POLL int
 var S3 string
 var UPLOAD string
 var DOWNLOAD string
-var JobMap map[string]interface{}
 var JobProp map[string]string
+
+type (
+	JobInfo struct {
+		Job []JobMap `json:"jobs"`
+	}
+
+	JobMap struct {
+		States     []string `json:"job_state"`
+		StartTime  int   `json:"start_time"`
+		SubmitTime int   `json:"submit_time"`
+		EndTime    int   `json:"end_time"`
+	}
+)
 
 // HPC job resource definitions
 var RESOURCES = map[string]string{
@@ -57,59 +70,55 @@ var RESOURCES = map[string]string{
 	"ErrorFileName":  "ERROR_FILE",
 }
 
-// Job ID
-type JobId struct {
-	Id int `json:"job_id"`
-}
-
-// HPC Job info
-type JobInfo struct {
-	Job []map[string]interface{} `json:"jobs"`
-}
-
 // Gets detailed job information for jobs that have the specified job IDs.
-// If job is not return by call to all jobs, returns 404
-func getJobInfo(slurmUsername string, slurmToken string, id string) *JobInfo {
-	url := HPCURL + "/job/" + id
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		klog.Error("Error creating Job Info request; err ", err)
-		return nil
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-SLURM-USER-NAME", slurmUsername)
-	req.Header.Set("X-SLURM-USER-TOKEN", slurmToken)
+func getJobInfo(slurmUsername string, slurmPassword string, id string) *JobMap {
+    sshConfig := &ssh.ClientConfig{
+        User: slurmUsername,
+        Auth: []ssh.AuthMethod{
+            ssh.Password(slurmPassword),
+        },
+        HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+    }
 
-	respBody, statusCode := podutils.SendReq(req)
-	if statusCode != 200 {
-		klog.Error("Retrieving job info not successful, status code ", statusCode)
-		return nil
-	}
+    client, err := ssh.Dial("tcp", HPCURL + ":22", sshConfig)
+    if err != nil {
+        klog.Error("Failed to dial: %s", err)
+    }
 
-	job := JobInfo{}
-	err = json.Unmarshal(respBody, &job)
-	JobMap = job.Job[0]
-	return &job
+    session, err := client.NewSession()
+    if err != nil {
+        klog.Error("Failed to create session: %s", err)
+    }
+    defer session.Close()
+
+    var b bytes.Buffer
+    session.Stdout = &b
+    if err := session.Run("scontrol show job --json " + id); err != nil {
+        klog.Error("Failed to run: %s", err)
+    }
+
+    job := JobInfo{}
+    err = json.Unmarshal(b.Bytes(), &job)
+    jobMap := job.Job[0]
+    return &jobMap
 }
 
-func checkSlurmToken(slurmUsername string, slurmToken string) {
-	url := HPCURL + "/ping"
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		klog.Error("Error creating ping request; err ", err)
-		os.Exit(1)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-SLURM-USER-NAME", slurmUsername)
-	req.Header.Set("X-SLURM-USER-TOKEN", slurmToken)
 
-	_, statusCode := podutils.SendReq(req)
-	if statusCode != 200 {
-		klog.Error("Ping to HPC cluster not successful, check SLURM Token ", statusCode)
-		os.Exit(1)
-	}
+func checkSlurmAccess(slurmUsername string, slurmPassword string) {
+    sshConfig := &ssh.ClientConfig{
+        User: slurmUsername,
+        Auth: []ssh.AuthMethod{
+            ssh.Password(slurmPassword),
+        },
+        HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+    }
 
+    _, err := ssh.Dial("tcp", HPCURL + ":22", sshConfig)
+    if err != nil {
+        klog.Exit("Ping to HPC cluster not successful, check SLURM Token ", err)
+    }
 }
+
 
 // Build body for the HPC job submission
 func buildBody(script string) string {
@@ -120,100 +129,118 @@ func buildBody(script string) string {
 }
 
 // Submit request for job execution
-func submit(slurmUsername string, slurmToken string, data map[string]string) int {
-	url := HPCURL + "/job/submit"
-	jobscript := ""
-	if data["jobdata.scriptLocation"] == "s3" {
-		s3info := strings.Split(data["jobdata.jobScript"], ":")
-		jobscript = podutils.DownloadS3Data(s3info[0], s3info[1], data)
-	} else {
-		jobscript = data["jobdata.jobScript"]
-	}
+func submit(slurmUsername string, slurmPassword string, data map[string]string) int {
+    jobscript := data["jobdata.jobScript"]
 
-	paramstr := data["jobproperties"]
-	err := json.Unmarshal([]byte(paramstr), &JobProp)
-	if err != nil {
-		klog.Info("Error in JobProperties provided ", err)
+    sshConfig := &ssh.ClientConfig{
+        User: slurmUsername,
+        Auth: []ssh.AuthMethod{
+            ssh.Password(slurmPassword),
+        },
+        HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+    }
 
-	}
-	str_body := buildBody(jobscript)
+    client, err := ssh.Dial("tcp", HPCURL + ":22", sshConfig)
+    if err != nil {
+        klog.Error("Failed to dial: %s", err)
+        return 0
+    }
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(str_body))
-	if err != nil {
-		klog.Error("Failed to create http request to connect to HPC cluster ", err)
-		return 0
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-SLURM-USER-NAME", slurmUsername)
-	req.Header.Set("X-SLURM-USER-TOKEN", slurmToken)
+    session, err := client.NewSession()
+    if err != nil {
+        klog.Error("Failed to create session: %s", err)
+        return 0
+    }
+    defer session.Close()
 
-	respBody, statusCode := podutils.SendReq(req)
+    var b bytes.Buffer
+    var berr bytes.Buffer
+    session.Stdout = &b
+    session.Stderr = &berr
 
-	if statusCode != 200 {
-		klog.Error("Submitting job not successful - status code ", statusCode, " err ", string(respBody))
-		return 0
-	}
+    if err := session.Run("echo -e '" + jobscript + "' | sbatch"); err != nil {
+        klog.Error("Failed to run: %s\n%s", err, berr.String())
+        return 0
+    }
 
-	var id JobId
-	json.Unmarshal(respBody, &id)
-	if id.Id == 0 {
-		klog.Error("Job submittion failed (id 0)")
-		return 0
-	}
-	klog.Info("Successfully submitted a job with job id ", id.Id)
-	return id.Id
+    resp := b.String()
+    parts := strings.Split(resp, " ")
+    if len(parts) < 2 {
+        klog.Error("Job submission failed: unexpected sbatch message: %s", b.String())
+        return 0
+    }
+
+    id, err := strconv.Atoi(strings.TrimSuffix(parts[3], "\n"))
+    if err != nil {
+      klog.Error("Job submission failed: %s", err)
+        return 0
+    }
+
+    klog.Info("Successfully submitted a job with job id ", id)
+    return id
 }
 
 // Kill HPC Job
-func kill(slurmUsername string, slurmToken string, id string) string {
-	url := HPCURL + "job" + id
+func kill(slurmUsername string, slurmPassword string, id string) string {
+    sshConfig := &ssh.ClientConfig{
+        User: slurmUsername,
+        Auth: []ssh.AuthMethod{
+            ssh.Password(slurmPassword),
+        },
+        HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+    }
 
-	req, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		return fmt.Sprintf("Failed to create job kill request, err: %s", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-SLURM-USER-NAME", slurmUsername)
-	req.Header.Set("X-SLURM-USER-TOKEN", slurmToken)
+    client, err := ssh.Dial("tcp", HPCURL + ":22", sshConfig)
+    if err != nil {
+        return fmt.Sprintf("Failed to create SSH connection to kill job, err: %s", err)
+    }
 
-	respBody, statusCode := podutils.SendReq(req)
-	if statusCode != 200 {
-		return fmt.Sprintf("Failed to execute job kill request, status %d, respBody %s", statusCode, string(respBody))
-	}
-	return ""
+    session, err := client.NewSession()
+    if err != nil {
+        return fmt.Sprintf("Failed to create SSH session to kill job, err: %s", err)
+    }
+    defer session.Close()
+
+    var b bytes.Buffer
+    session.Stdout = &b
+    if err := session.Run("scancel " + id); err != nil {
+        return fmt.Sprintf("Failed to execute job kill, err %s", err)
+
+    }
+
+    return b.String()
 }
 
 // Get login token
-func getToken() (string, string) {
+func getUsernamePassword() (string, string) {
 	username := podutils.ReadMountedFileContent(CREDS_DIR + "username")
 	password := podutils.ReadMountedFileContent(CREDS_DIR + "password")
 	return username, password
 }
 
 // Add additional information from HPC
-func getAdditionalInfo(info map[string]string) {
-	start := JobMap["start_time"]
+func getAdditionalInfo(jobMap *JobMap, info map[string]string) {
+	start := jobMap.StartTime
 	if start != 0 {
 		info["startTime"] = fmt.Sprint(start)
 	}
-	sub := JobMap["submit_time"]
+	sub := jobMap.SubmitTime
 	if sub != 0 {
 		info["submitTime"] = fmt.Sprint(sub)
 	}
-	end := JobMap["end_time"]
+	end := jobMap.EndTime
 	if end != 0 {
 		info["endTime"] = fmt.Sprint(end)
 	}
 }
 
 // Kill the job
-func killJob(slurmUsername string, slurmToken string, id string, state string, info map[string]string) {
+func killJob(slurmUsername string, slurmPassword string, id string, state string, info map[string]string) {
 	// Check if the job is still running
 	running := state != CANCELLED && state != COMPLETED && state != FAILED
 	if running {
 		// Only kill jobs that are still running
-		res := kill(slurmUsername, slurmToken, id)
+		res := kill(slurmUsername, slurmPassword, id)
 		if len(res) == 0 {
 			klog.Info("Job", id, "killed successfully.")
 			info["jobStatus"] = CANCELLED
@@ -228,7 +255,7 @@ func killJob(slurmUsername string, slurmToken string, id string, state string, i
 
 // Monitoring job execution
 // Method that runs constantly monitoring HPC job
-func monitor(slurmUsername string, slurmToken string, info map[string]string) {
+func monitor(slurmUsername string, slurmPassword string, info map[string]string) {
 	id := info["id"]
 	// Run forever
 	for {
@@ -240,18 +267,18 @@ func monitor(slurmUsername string, slurmToken string, info map[string]string) {
 
 		// Get current execution status and update config map
 		var state = ""
-		job := getJobInfo(slurmUsername, slurmToken, id)
-		if job != nil {
-			jstate := JobMap["job_state"]
+		jobMap := getJobInfo(slurmUsername, slurmPassword, id)
+		if jobMap != nil {
+			jstate := jobMap.States[0]
 			state = fmt.Sprint(jstate)
 			info["jobStatus"] = state
 			if state == COMPLETED || state == COMPLETING || state == CANCELLED || state == FAILED {
 				// Get additional info from HPC job
-				getAdditionalInfo(info)
+				getAdditionalInfo(jobMap, info)
 			} else {
 				// Check for kill flag
 				if cm.Data["kill"] == "true" {
-					killJob(slurmUsername, slurmToken, id, info["jobStatus"], info)
+					killJob(slurmUsername, slurmPassword, id, info["jobStatus"], info)
 				}
 			}
 			podutils.UpdateConfigMap(cm, info)
@@ -270,6 +297,7 @@ func monitor(slurmUsername string, slurmToken string, info map[string]string) {
 // Main method
 func main() {
 
+  klog.Info("In main !!!")
 	// Get namespace and job name from environment
 	NAMESPACE = os.Getenv("NAMESPACE")
 	JOB_NAME = os.Getenv("JOBNAME")
@@ -284,10 +312,10 @@ func main() {
 	S3 = cm.Data["s3.secret"]
 
 	// Get Access Username, Token for Slurm  cluster
-	slurmUsername, slurmToken := getToken()
-	checkSlurmToken(slurmUsername, slurmToken)
+	slurmUsername, slurmPassword := getUsernamePassword()
+	checkSlurmAccess(slurmUsername, slurmPassword)
 
-	if len(slurmToken) == 0 || len(slurmUsername) == 0 {
+	if len(slurmPassword) == 0 || len(slurmUsername) == 0 {
 		// Failed to get credentials for HPC cluster
 		klog.Exit("Failed to get access token for HPC cluster")
 	}
@@ -305,7 +333,7 @@ func main() {
 	if len(id) == 0 {
 		klog.Info("Slurm Job with name ", JOB_NAME, " does not exist. Submitting new job.")
 
-		intId := submit(slurmUsername, slurmToken, cm.Data)
+		intId := submit(slurmUsername, slurmPassword, cm.Data)
 		id = fmt.Sprint(intId)
 
 		if len(id) == 0 {
@@ -322,7 +350,7 @@ func main() {
 
 		// Start monitoring or exit
 		if len(id) != 0 {
-			monitor(slurmUsername, slurmToken, info)
+			monitor(slurmUsername, slurmPassword, info)
 		} else {
 			klog.Exit("Failed to start HPC job")
 		}
@@ -330,6 +358,6 @@ func main() {
 		// Job is already running
 		klog.Info("Slurm Job  has associated ID in ConfigMap. Handling state.")
 		info["id"] = id
-		monitor(slurmUsername, slurmToken, info)
+		monitor(slurmUsername, slurmPassword, info)
 	}
 }
